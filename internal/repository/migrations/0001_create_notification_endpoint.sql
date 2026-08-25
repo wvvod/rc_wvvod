@@ -1,0 +1,22 @@
+CREATE TABLE IF NOT EXISTS `notification_endpoint` (
+    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `endpoint_code` VARCHAR(128) NOT NULL,
+    `name` VARCHAR(255) NOT NULL,
+    `url` VARCHAR(2048) NOT NULL,
+    `method` VARCHAR(16) NOT NULL,
+    `content_type` VARCHAR(32) NOT NULL,
+    `body_mode` VARCHAR(32) NOT NULL,
+    `header_config` JSON NULL,
+    `body_template` JSON NULL,
+    `secret_config` JSON NULL,
+    `timeout_ms` INT NOT NULL DEFAULT 5000,
+    `rate_limit` INT NOT NULL DEFAULT 100,
+    `rate_limit_window_ms` INT NOT NULL DEFAULT 1000,
+    `enabled` TINYINT(1) NOT NULL DEFAULT 1,
+    `max_retry_count` INT NOT NULL DEFAULT 10,
+    `retry_http_statuses` JSON NULL,
+    `created_at` DATETIME NOT NULL,
+    `updated_at` DATETIME NOT NULL,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_endpoint_code` (`endpoint_code`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
