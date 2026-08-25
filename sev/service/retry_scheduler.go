@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"awesomeProject1/internal/repository"
+	"awesomeProject1/sev/repository"
 )
 
 type RetryScheduler struct {

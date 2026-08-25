@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"awesomeProject1/internal/model"
+	"awesomeProject1/sev/model"
 )
 
 func TestRetrySchedulerRunOnceProcessesPendingJob(t *testing.T) {

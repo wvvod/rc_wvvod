@@ -9,9 +9,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"awesomeProject1/internal/delivery"
-	"awesomeProject1/internal/model"
-	"awesomeProject1/internal/repository"
+	"awesomeProject1/sev/delivery"
+	"awesomeProject1/sev/model"
+	"awesomeProject1/sev/repository"
 )
 
 type Clock func() time.Time

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"awesomeProject1/internal/model"
+	"awesomeProject1/sev/model"
 )
 
 func TestTemplateBuilderBuildJSONTemplatePreservesTypes(t *testing.T) {

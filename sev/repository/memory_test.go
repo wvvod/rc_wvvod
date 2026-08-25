@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"awesomeProject1/internal/model"
+	"awesomeProject1/sev/model"
 )
 
 func TestMemoryRepositoryCreateJobIsIdempotent(t *testing.T) {

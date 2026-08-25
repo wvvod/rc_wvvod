@@ -12,11 +12,11 @@ import (
 	"syscall"
 	"time"
 
-	"awesomeProject1/internal/api"
-	"awesomeProject1/internal/delivery"
-	"awesomeProject1/internal/ratelimit"
-	"awesomeProject1/internal/repository"
-	"awesomeProject1/internal/service"
+	"awesomeProject1/sev/api"
+	"awesomeProject1/sev/delivery"
+	"awesomeProject1/sev/ratelimit"
+	"awesomeProject1/sev/repository"
+	"awesomeProject1/sev/service"
 
 	mysqlDriver "github.com/go-sql-driver/mysql"
 	gormmysql "gorm.io/driver/mysql"
