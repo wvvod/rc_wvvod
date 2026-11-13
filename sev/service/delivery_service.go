@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"math/rand"
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"awesomeProject1/sev/delivery"
@@ -18,6 +20,10 @@ import (
 )
 
 type DeliveryService struct {
+	successes      atomic.Uint64
+	failures       atomic.Uint64
+	retries        atomic.Uint64
+	durationMS     atomic.Uint64
 	repo           repository.Repository
 	limiter        ratelimit.Limiter
 	client         delivery.Doer
@@ -69,7 +75,7 @@ func (s *DeliveryService) Deliver(ctx context.Context, notificationID string) er
 	}
 
 	now := s.clock().UTC()
-	claimed, ok, err := s.repo.ClaimJob(ctx, notificationID, now, s.lockFor)
+	claimed, ok, err := s.repo.ClaimJob(ctx, notificationID, now, max(s.lockFor, job.Timeout.Duration()+10*time.Second))
 	if err != nil {
 		return err
 	}
@@ -160,16 +166,12 @@ func (s *DeliveryService) buildRequest(ctx context.Context, job model.Notificati
 func (s *DeliveryService) finishSuccess(ctx context.Context, job model.NotificationJob, httpStatus int, duration time.Duration) error {
 	job.Status = model.JobStatusSuccess
 	job.FailReason = ""
-	job.RetryCount = job.RetryCount
 	job.NextRetryAt = nil
 	job.LockedUntil = nil
 	job.HTTPStatus = &httpStatus
 	job.LastError = ""
 	job.UpdatedAt = s.clock().UTC()
-	if err := s.repo.UpdateJob(ctx, job); err != nil {
-		return err
-	}
-	return s.repo.AppendAttempt(ctx, model.NotificationAttempt{
+	return s.complete(ctx, job, model.NotificationAttempt{
 		NotificationID: job.NotificationID,
 		AttemptNo:      job.RetryCount + 1,
 		Result:         model.AttemptResultSuccess,
@@ -190,10 +192,7 @@ func (s *DeliveryService) finishWithFailure(ctx context.Context, job model.Notif
 	}
 	job.LastError = truncateError(errMsg)
 	job.UpdatedAt = s.clock().UTC()
-	if err := s.repo.UpdateJob(ctx, job); err != nil {
-		return err
-	}
-	return s.repo.AppendAttempt(ctx, model.NotificationAttempt{
+	return s.complete(ctx, job, model.NotificationAttempt{
 		NotificationID: job.NotificationID,
 		AttemptNo:      job.RetryCount + 1,
 		Result:         result,
@@ -206,13 +205,16 @@ func (s *DeliveryService) finishWithFailure(ctx context.Context, job model.Notif
 }
 
 func (s *DeliveryService) finishRetry(ctx context.Context, job model.NotificationJob, attemptNo int, result model.AttemptResult, reason model.FailReason, duration time.Duration, errMsg string, httpStatuses ...int) error {
-	if attemptNo > job.MaxRetryCount && job.MaxRetryCount > 0 {
+	limited := reason == model.FailReasonRateLimited || reason == model.FailReasonRateLimitError
+	if !limited && attemptNo > job.MaxRetryCount && job.MaxRetryCount > 0 {
 		return s.finishWithFailure(ctx, job, firstHTTPStatus(httpStatuses...), model.AttemptResultFailed, model.FailReasonMaxRetryExceeded, duration, errMsg)
 	}
 
 	job.Status = model.JobStatusRetryWait
 	job.FailReason = reason
-	job.RetryCount = attemptNo
+	if !limited {
+		job.RetryCount = attemptNo
+	}
 	job.LockedUntil = nil
 	if len(httpStatuses) > 0 && httpStatuses[0] > 0 {
 		job.HTTPStatus = &httpStatuses[0]
@@ -221,13 +223,15 @@ func (s *DeliveryService) finishRetry(ctx context.Context, job model.Notificatio
 	}
 	job.LastError = truncateError(errMsg)
 	delay := s.nextDelay(reason, attemptNo)
+	if limited {
+		if ep, ok, err := s.repo.GetEndpoint(ctx, job.EndpointCode); err == nil && ok {
+			delay = max(delay, ep.RateLimitWindow.Duration())
+		}
+	}
 	nextRetry := s.clock().UTC().Add(delay)
 	job.NextRetryAt = &nextRetry
 	job.UpdatedAt = s.clock().UTC()
-	if err := s.repo.UpdateJob(ctx, job); err != nil {
-		return err
-	}
-	return s.repo.AppendAttempt(ctx, model.NotificationAttempt{
+	return s.complete(ctx, job, model.NotificationAttempt{
 		NotificationID: job.NotificationID,
 		AttemptNo:      attemptNo,
 		Result:         result,
@@ -318,4 +322,25 @@ func firstHTTPStatus(statuses ...int) int {
 		}
 	}
 	return 0
+}
+
+func (s *DeliveryService) Metrics() map[string]uint64 {
+	return map[string]uint64{"success_total": s.successes.Load(), "failure_total": s.failures.Load(), "retry_wait_total": s.retries.Load(), "attempt_duration_ms_total": s.durationMS.Load()}
+}
+
+func (s *DeliveryService) complete(ctx context.Context, job model.NotificationJob, attempt model.NotificationAttempt) error {
+	if err := s.repo.FinishAttempt(ctx, job, attempt); err != nil {
+		return err
+	}
+	s.durationMS.Add(uint64(max(attempt.DurationMS, 0)))
+	switch job.Status {
+	case model.JobStatusSuccess:
+		s.successes.Add(1)
+	case model.JobStatusFailed:
+		s.failures.Add(1)
+	case model.JobStatusRetryWait:
+		s.retries.Add(1)
+	}
+	slog.Info("notification attempt completed", "notification_id", job.NotificationID, "status", job.Status, "reason", job.FailReason, "duration_ms", attempt.DurationMS)
+	return nil
 }

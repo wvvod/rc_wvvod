@@ -15,7 +15,11 @@ var (
 	ErrNotFound = errors.New("not found")
 )
 
+var ErrConflict = errors.New("conflict")
+
 type Repository interface {
+	FinishAttempt(context.Context, model.NotificationJob, model.NotificationAttempt) error
+	RetryFailed(context.Context, string, time.Time) (model.NotificationJob, error)
 	UpsertEndpoint(ctx context.Context, endpoint model.Endpoint) error
 	GetEndpoint(ctx context.Context, code string) (model.Endpoint, bool, error)
 	ListEndpoints(ctx context.Context) ([]model.Endpoint, error)
@@ -202,6 +206,7 @@ func (r *MemoryRepository) ClaimJob(_ context.Context, notificationID string, no
 		return cloneJob(job), false, nil
 	}
 
+	job.LeaseVersion++
 	job.Status = model.JobStatusProcessing
 	job.LockedUntil = ptrTime(now.Add(lockFor))
 	job.UpdatedAt = now.UTC()
@@ -401,4 +406,42 @@ func cloneAny(in any) any {
 func ptrTime(t time.Time) *time.Time {
 	out := t.UTC()
 	return &out
+}
+
+func (r *MemoryRepository) FinishAttempt(_ context.Context, job model.NotificationJob, attempt model.NotificationAttempt) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current, ok := r.jobs[job.NotificationID]
+	if !ok {
+		return ErrNotFound
+	}
+	if current.Status != model.JobStatusProcessing || current.LeaseVersion != job.LeaseVersion {
+		return ErrConflict
+	}
+	job.AttemptCount = current.AttemptCount + 1
+	attempt.AttemptNo = job.AttemptCount
+	r.jobs[job.NotificationID] = cloneJob(job)
+	r.attempts[job.NotificationID] = append(r.attempts[job.NotificationID], cloneAttempt(attempt))
+	return nil
+}
+func (r *MemoryRepository) RetryFailed(_ context.Context, id string, now time.Time) (model.NotificationJob, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	job, ok := r.jobs[id]
+	if !ok {
+		return job, ErrNotFound
+	}
+	if job.Status != model.JobStatusFailed {
+		return job, ErrConflict
+	}
+	job.Status = model.JobStatusRetryWait
+	job.RetryCount = 0
+	job.NextRetryAt = ptrTime(now)
+	job.LockedUntil = nil
+	job.FailReason = ""
+	job.LastError = ""
+	job.HTTPStatus = nil
+	job.UpdatedAt = now
+	r.jobs[id] = cloneJob(job)
+	return cloneJob(job), nil
 }

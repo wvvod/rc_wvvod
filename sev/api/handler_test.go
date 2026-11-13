@@ -49,6 +49,13 @@ func TestHandlerCreateQueryAndRetryFlow(t *testing.T) {
 	}
 	deliveryService := service.NewDeliveryService(repo, ratelimit.NewMemoryLimiter(time.Now), client, func() time.Time { return now }, func() float64 { return 0.5 })
 	handler := NewHandler(notificationService, deliveryService)
+	scheduler := service.NewRetryScheduler(repo, deliveryService, time.Now, 100, 2, time.Millisecond)
+	schedulerCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	defer func() { cancel(); <-done }()
+	handler.SetWake(scheduler.Wake)
+	go func() { defer close(done); _ = scheduler.Run(schedulerCtx) }()
 
 	endpointReq := model.CreateEndpointRequest{
 		EndpointCode:      "crm_payment_success",

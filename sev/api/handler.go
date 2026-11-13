@@ -1,7 +1,6 @@
 package api
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -16,6 +15,7 @@ import (
 type Handler struct {
 	notifications *service.NotificationService
 	delivery      *service.DeliveryService
+	wake          func()
 }
 
 func NewHandler(notifications *service.NotificationService, delivery *service.DeliveryService) *Handler {
@@ -151,9 +151,9 @@ func (h *Handler) retryNotification(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) triggerDelivery(notificationID string) {
-	go func() {
-		_ = h.delivery.Deliver(context.Background(), notificationID)
-	}()
+	if h.wake != nil {
+		h.wake()
+	}
 }
 
 func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, limit int64) error {
@@ -188,11 +188,14 @@ func writeError(w http.ResponseWriter, status int, message string) {
 }
 
 func statusForError(err error) int {
+	var validation *service.ValidationError
 	switch {
+	case errors.As(err, &validation):
+		return http.StatusBadRequest
+	case errors.Is(err, repository.ErrConflict):
+		return http.StatusConflict
 	case errors.Is(err, repository.ErrNotFound):
 		return http.StatusNotFound
-	case strings.Contains(strings.ToLower(err.Error()), "invalid"):
-		return http.StatusBadRequest
 	default:
 		return http.StatusInternalServerError
 	}
@@ -262,3 +265,5 @@ func sanitizeEndpoint(endpoint model.Endpoint) map[string]any {
 		"max_retry_count":      endpoint.MaxRetryCount,
 	}
 }
+
+func (h *Handler) SetWake(wake func()) { h.wake = wake }

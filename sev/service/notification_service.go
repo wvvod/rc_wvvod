@@ -1,10 +1,12 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -39,6 +41,9 @@ func NewNotificationService(repo repository.Repository, builder delivery.Request
 }
 
 func (s *NotificationService) CreateEndpoint(ctx context.Context, req model.CreateEndpointRequest) (model.Endpoint, error) {
+	if err := validateEndpoint(req); err != nil {
+		return model.Endpoint{}, err
+	}
 	if req.EndpointCode == "" {
 		return model.Endpoint{}, fmt.Errorf("endpoint_code is required")
 	}
@@ -112,6 +117,9 @@ func (s *NotificationService) CreateEndpoint(ctx context.Context, req model.Crea
 }
 
 func (s *NotificationService) CreateNotification(ctx context.Context, req model.CreateNotificationRequest) (model.NotificationJob, bool, error) {
+	if err := validateNotification(req); err != nil {
+		return model.NotificationJob{}, false, err
+	}
 	if req.RequestID == "" {
 		return model.NotificationJob{}, false, fmt.Errorf("request_id is required")
 	}
@@ -128,6 +136,9 @@ func (s *NotificationService) CreateNotification(ctx context.Context, req model.
 	if existing, ok, err := s.repo.GetJobByBusinessRequest(ctx, req.Business, req.RequestID); err != nil {
 		return model.NotificationJob{}, false, err
 	} else if ok {
+		if !sameRequest(existing, req) {
+			return model.NotificationJob{}, false, repository.ErrConflict
+		}
 		return existing, false, nil
 	}
 
@@ -136,12 +147,12 @@ func (s *NotificationService) CreateNotification(ctx context.Context, req model.
 		return model.NotificationJob{}, false, err
 	}
 	if !ok {
-		return model.NotificationJob{}, false, fmt.Errorf("endpoint %s not found", req.EndpointCode)
+		return model.NotificationJob{}, false, fmt.Errorf("endpoint %s: %w", req.EndpointCode, repository.ErrNotFound)
 	}
 
 	snapshot, err := s.builder.Build(endpoint, req.Payload)
 	if err != nil {
-		return model.NotificationJob{}, false, err
+		return model.NotificationJob{}, false, invalid(err.Error())
 	}
 
 	notificationID := s.idGen()
@@ -181,6 +192,9 @@ func (s *NotificationService) CreateNotification(ctx context.Context, req model.
 		return model.NotificationJob{}, false, err
 	}
 	if existed {
+		if !sameRequest(created, req) {
+			return model.NotificationJob{}, false, repository.ErrConflict
+		}
 		return created, false, nil
 	}
 	return created, true, nil
@@ -195,30 +209,7 @@ func (s *NotificationService) ListAttempts(ctx context.Context, notificationID s
 }
 
 func (s *NotificationService) RetryNotification(ctx context.Context, notificationID string) (model.NotificationJob, error) {
-	job, ok, err := s.repo.GetJob(ctx, notificationID)
-	if err != nil {
-		return model.NotificationJob{}, err
-	}
-	if !ok {
-		return model.NotificationJob{}, repository.ErrNotFound
-	}
-	if job.Status == model.JobStatusSuccess {
-		return model.NotificationJob{}, fmt.Errorf("notification already succeeded")
-	}
-
-	now := s.clock().UTC()
-	job.Status = model.JobStatusRetryWait
-	job.FailReason = ""
-	job.NextRetryAt = &now
-	job.LockedUntil = nil
-	job.UpdatedAt = now
-	if job.MaxRetryCount <= 0 {
-		job.MaxRetryCount = 10
-	}
-	if err := s.repo.UpdateJob(ctx, job); err != nil {
-		return model.NotificationJob{}, err
-	}
-	return job, nil
+	return s.repo.RetryFailed(ctx, notificationID, s.clock().UTC())
 }
 
 func defaultRetryHTTPStatuses() map[int]struct{} {
@@ -241,4 +232,10 @@ func defaultNotificationID() string {
 		binary.BigEndian.PutUint32(randomPart[:], uint32(time.Now().UnixNano()))
 	}
 	return fmt.Sprintf("ntf_%d_%s_%06d", time.Now().UTC().UnixNano(), hex.EncodeToString(randomPart[:]), n%1000000)
+}
+
+func sameRequest(job model.NotificationJob, req model.CreateNotificationRequest) bool {
+	a, e1 := json.Marshal(job.Payload)
+	b, e2 := json.Marshal(req.Payload)
+	return e1 == nil && e2 == nil && job.EndpointCode == req.EndpointCode && bytes.Equal(a, b)
 }

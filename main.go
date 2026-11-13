@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -50,21 +52,45 @@ func main() {
 	notificationService := service.NewNotificationService(gormRepo, builder, time.Now, nil)
 	scheduler := service.NewRetryScheduler(gormRepo, deliveryService, time.Now, 100, 10, time.Second)
 	handler := api.NewHandler(notificationService, deliveryService)
+	handler.SetWake(scheduler.Wake)
 
 	mux := http.NewServeMux()
 	mux.Handle("/api/", handler)
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		checkCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		counts, err := gormRepo.StatusCounts(checkCtx)
+		if err != nil {
+			http.Error(w, "metrics unavailable", 503)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"delivery": deliveryService.Metrics(), "jobs": counts})
+	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
 
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		checkCtx, cancel := context.WithTimeout(r.Context(), time.Second)
+		defer cancel()
+		if !scheduler.Healthy() || sqlDB.PingContext(checkCtx) != nil {
+			http.Error(w, "not ready", 503)
+			return
+		}
+		w.WriteHeader(200)
+	})
+	var workers sync.WaitGroup
 	server := &http.Server{
 		Addr:              ":8080",
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
+	workers.Add(1)
 	go func() {
+		defer workers.Done()
 		if err := scheduler.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("scheduler stopped: %v", err)
 		}
@@ -81,6 +107,8 @@ func main() {
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
+	stop()
+	workers.Wait()
 }
 
 func openGormDB(ctx context.Context, dsn string) (*gorm.DB, error) {
@@ -93,6 +121,9 @@ func openGormDB(ctx context.Context, dsn string) (*gorm.DB, error) {
 		return nil, fmt.Errorf("parse mysql dsn: %w", err)
 	}
 	cfg.ParseTime = true
+	cfg.Timeout = 5 * time.Second
+	cfg.ReadTimeout = 5 * time.Second
+	cfg.WriteTimeout = 5 * time.Second
 	if cfg.Loc == nil {
 		cfg.Loc = time.UTC
 	}
