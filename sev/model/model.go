@@ -131,6 +131,8 @@ type NotificationJob struct {
 	ContentType    ContentType       `gorm:"column:content_type;size:32;not null" json:"content_type"`
 	Timeout        MillisDuration    `gorm:"column:timeout_ms;type:int;not null" json:"timeout_ms"`
 
+	LeaseVersion  uint64     `gorm:"column:lease_version;not null;default:0" json:"-"`
+	AttemptCount  int        `gorm:"column:attempt_count;not null;default:0" json:"-"`
 	Status        JobStatus  `gorm:"column:status;size:32;not null;index:idx_retry,priority:1;index:idx_processing,priority:1" json:"status"`
 	FailReason    FailReason `gorm:"column:fail_reason;size:64" json:"fail_reason,omitempty"`
 	RetryCount    int        `gorm:"column:retry_count;not null;default:0" json:"retry_count"`

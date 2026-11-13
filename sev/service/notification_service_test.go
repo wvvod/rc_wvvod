@@ -85,6 +85,10 @@ func TestNotificationServiceCreateNotificationIsIdempotent(t *testing.T) {
 		t.Fatalf("expected duplicate to return same id")
 	}
 
+	job.Status = model.JobStatusFailed
+	if err := repo.UpdateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
 	retryJob, err := svc.RetryNotification(ctx, job.NotificationID)
 	if err != nil {
 		t.Fatalf("retry notification: %v", err)

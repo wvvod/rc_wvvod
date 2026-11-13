@@ -2,7 +2,9 @@ package service
 
 import (
 	"context"
+	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"awesomeProject1/sev/repository"
@@ -15,6 +17,8 @@ type RetryScheduler struct {
 	batchSize   int
 	workerCount int
 	interval    time.Duration
+	wake        chan struct{}
+	healthy     atomic.Bool
 }
 
 func NewRetryScheduler(repo repository.Repository, delivery *DeliveryService, clock Clock, batchSize, workerCount int, interval time.Duration) *RetryScheduler {
@@ -32,6 +36,7 @@ func NewRetryScheduler(repo repository.Repository, delivery *DeliveryService, cl
 	}
 	return &RetryScheduler{
 		repo:        repo,
+		wake:        make(chan struct{}, 1),
 		delivery:    delivery,
 		clock:       clock,
 		batchSize:   batchSize,
@@ -44,14 +49,32 @@ func (s *RetryScheduler) Run(ctx context.Context) error {
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
 
+	backoff := s.interval
 	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if _, err := s.RunOnce(ctx); err != nil {
-			return err
+			s.healthy.Store(false)
+			log.Printf("scheduler scan failed: %v", err)
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+			backoff = min(backoff*2, 30*time.Second)
+			continue
+		} else {
+			s.healthy.Store(true)
+			backoff = s.interval
 		}
 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-s.wake:
 		case <-ticker.C:
 		}
 	}
@@ -79,7 +102,11 @@ func (s *RetryScheduler) RunOnce(ctx context.Context) (int, error) {
 		go func() {
 			defer wg.Done()
 			for notificationID := range jobCh {
-				_ = s.delivery.Deliver(ctx, notificationID)
+				attemptCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 310*time.Second)
+				if err := s.delivery.Deliver(attemptCtx, notificationID); err != nil {
+					log.Printf("delivery %s failed: %v", notificationID, err)
+				}
+				cancel()
 			}
 		}()
 	}
@@ -98,3 +125,11 @@ func (s *RetryScheduler) RunOnce(ctx context.Context) (int, error) {
 
 	return len(jobs), nil
 }
+
+func (s *RetryScheduler) Wake() {
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+func (s *RetryScheduler) Healthy() bool { return s.healthy.Load() }

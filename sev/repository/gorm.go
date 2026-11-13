@@ -138,27 +138,7 @@ func (r *GormRepository) UpdateJob(ctx context.Context, job model.NotificationJo
 	}
 	return r.db.WithContext(ctx).Model(&model.NotificationJob{}).
 		Where("notification_id = ?", job.NotificationID).
-		Select(
-			"RequestID",
-			"Business",
-			"EndpointCode",
-			"Payload",
-			"RequestURL",
-			"RequestMethod",
-			"RequestHeaders",
-			"RequestBody",
-			"ContentType",
-			"Timeout",
-			"Status",
-			"FailReason",
-			"RetryCount",
-			"MaxRetryCount",
-			"NextRetryAt",
-			"LockedUntil",
-			"HTTPStatus",
-			"LastError",
-			"UpdatedAt",
-		).
+		Select("Status", "FailReason", "RetryCount", "NextRetryAt", "LockedUntil", "HTTPStatus", "LastError", "UpdatedAt").
 		Updates(job).Error
 }
 
@@ -189,9 +169,10 @@ func (r *GormRepository) ClaimJob(ctx context.Context, notificationID string, no
 
 		lockUntil := now.Add(lockFor)
 		updates := map[string]any{
-			"status":       model.JobStatusProcessing,
-			"locked_until": lockUntil,
-			"updated_at":   now.UTC(),
+			"status":        model.JobStatusProcessing,
+			"locked_until":  lockUntil,
+			"updated_at":    now.UTC(),
+			"lease_version": selected.LeaseVersion + 1,
 		}
 		if err := tx.Model(&model.NotificationJob{}).
 			Where("notification_id = ?", notificationID).
@@ -199,6 +180,7 @@ func (r *GormRepository) ClaimJob(ctx context.Context, notificationID string, no
 			return err
 		}
 
+		selected.LeaseVersion++
 		selected.Status = model.JobStatusProcessing
 		selected.LockedUntil = &lockUntil
 		selected.UpdatedAt = now.UTC()
@@ -258,4 +240,62 @@ func (r *GormRepository) ListAttempts(ctx context.Context, notificationID string
 		return nil, err
 	}
 	return attempts, nil
+}
+
+func (r *GormRepository) FinishAttempt(ctx context.Context, job model.NotificationJob, attempt model.NotificationAttempt) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var current model.NotificationJob
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("notification_id = ?", job.NotificationID).First(&current).Error; err != nil {
+			return err
+		}
+		if current.Status != model.JobStatusProcessing || current.LeaseVersion != job.LeaseVersion {
+			return ErrConflict
+		}
+		attempt.AttemptNo = current.AttemptCount + 1
+		updates := map[string]any{"status": job.Status, "fail_reason": job.FailReason, "retry_count": job.RetryCount, "next_retry_at": job.NextRetryAt, "locked_until": job.LockedUntil, "http_status": job.HTTPStatus, "last_error": job.LastError, "updated_at": job.UpdatedAt, "attempt_count": attempt.AttemptNo}
+		if err := tx.Model(&model.NotificationJob{}).Where("notification_id = ?", job.NotificationID).Updates(updates).Error; err != nil {
+			return err
+		}
+		return tx.Create(&attempt).Error
+	})
+}
+func (r *GormRepository) RetryFailed(ctx context.Context, id string, now time.Time) (model.NotificationJob, error) {
+	var job model.NotificationJob
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("notification_id = ?", id).First(&job).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if job.Status != model.JobStatusFailed {
+			return ErrConflict
+		}
+		job.Status = model.JobStatusRetryWait
+		job.RetryCount = 0
+		job.NextRetryAt = &now
+		job.LockedUntil = nil
+		job.FailReason = ""
+		job.LastError = ""
+		job.HTTPStatus = nil
+		job.UpdatedAt = now
+		return (&GormRepository{db: tx}).UpdateJob(ctx, job)
+	})
+	return job, err
+}
+
+func (r *GormRepository) StatusCounts(ctx context.Context) (map[string]int64, error) {
+	var rows []struct {
+		Status string
+		Count  int64
+	}
+	if err := r.db.WithContext(ctx).Model(&model.NotificationJob{}).Select("status, COUNT(*) AS count").Group("status").Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	result := map[string]int64{}
+	for _, row := range rows {
+		result[row.Status] = row.Count
+	}
+	return result, nil
 }
